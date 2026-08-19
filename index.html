@@ -489,9 +489,6 @@ const SEED_CADASTRO = [
 ["3000001018","CERA KIJOIA INCOLOR 0,75L CX12","CERA","0,75L","KIJOIA",85,"baixa"],
 ["3000001024","CERA KIJOIA VERMELHA 0,75L CX12","CERA","0,75L","KIJOIA",85,"baixa"],
 ["3000001050","TIRA MANCHAS GEO LIQUID 1,5L","TIRA MANCHA","1,5L","GEO",null,"sem_padrao"],
-["3000001101","CERA KIJOIA VERDE 0,75L CX12","CERA","0,75L","KIJOIA",85,"baixa"],
-["3000001102","CERA KIJOIA PRETA 0,75L CX12","CERA","0,75L","KIJOIA",85,"baixa"],
-["3000001016","CERA KIJOIA AMARELA 0,75L CX12","CERA","0,75L","KIJOIA",85,"baixa"],
 ["3000001169","AMAC FLOM INT MYSTIC ANTIFRI 0,5L CX12","AMACIANTE CONCENTRADO","0,5L","FLOM",90,"alta"],
 ["3000001175","LR LIQUIDO GEO ACTION COCO 1L CX12","LAVA ROUPAS LIQUIDO","1L","GEO",60,"alta"],
 ["3000001182","AMAC FLOM TRAD ANTIFRI 1,8L CX06","AMACIANTE CONCENTRADO","1,8L","FLOM",60,"alta"],
@@ -654,54 +651,50 @@ async function extractPdfText(file){
 }
 
 // ---------------------------------------------------------------------
-// AI structuring via Claude
+// Interpretação da NF (sem IA / sem internet) — parsing por padrão de texto
 // ---------------------------------------------------------------------
-async function structureWithClaude(rawText){
-  const systemPrompt = `Você recebe o texto extraído de uma DANFE (nota fiscal eletrônica brasileira) da empresa N&L Indústria.
-O texto pode vir com quebras de linha estranhas, pois foi extraído de um PDF por posição.
-
-Sua tarefa: devolver APENAS um JSON válido (sem markdown, sem comentário, sem texto antes ou depois) no formato:
-
-{
-  "cabecalho": {
-    "nf_numero": "string ou null",
-    "data_emissao": "string DD/MM/AAAA ou null",
-    "motorista": "string ou null (deixe null se não houver transportador nomeado)",
-    "placa": "string ou null"
-  },
-  "itens": [
-    {
-      "codigo_produto": "string com o código completo do produto tal como aparece em COD.PROD (apenas dígitos, concatene se estiver quebrado em duas linhas)",
-      "descricao": "string com a descrição do produto, incluindo o sufixo de embalagem se houver (ex: CX12, FD10, PC24)",
-      "unidade": "string, ex: CX, FD, PC, UN",
-      "quantidade": número decimal da coluna QTDE (use ponto decimal no JSON, mesmo que o documento use vírgula)
-    }
-  ]
+// A DANFE do N&L segue sempre o mesmo layout. Cada item de produto aparece assim
+// (depois do agrupamento por posição feito em extractPdfText):
+//   <17 primeiros dígitos do código> <descrição...> <NCM> <CST> <CFOP> <UNID> <QTDE> <...8 outros números>
+//   <último dígito do código>[ <resto da descrição, ex: volume + embalagem>]
+function parseNFCabecalho(rawText){
+  const m = rawText.match(/N[°º]\s*(\d{4,8})/);
+  return { nf_numero: m ? m[1] : null };
 }
 
-Regras importantes:
-- Cada linha da tabela "DADOS DO PRODUTO / SERVIÇO" vira um item. Ignore linhas de cabeçalho de tabela, totais e impostos.
-- O código do produto pode aparecer quebrado (ex: "00000000300000136" seguido de "9" na linha seguinte) — concatene em uma string só de dígitos.
-- A quantidade é a coluna QTDE, não confunda com valores monetários.
-- Se o mesmo produto aparecer em mais de uma linha, devolva cada ocorrência separadamente (não some).
-- Não invente dados: se um campo do cabeçalho não existir no texto, use null.`;
+function parseNFItens(rawText){
+  const lines = rawText.split('\n').map(l=>l.trim()).filter(l=>l.length>0);
+  const rowPattern = /^(\d{17})\s+(.+?)\s+(\d{7,8})\s+(\d{2,3})\s+(\d{3,4})\s+(CX|FD|PC|UN|UND|KG|PT|SC)\s+([\d.,]+)(?:\s+[\d.,]+){8}\s*$/;
+  const contPattern = /^(\d{1,2})\s*(.*)$/;
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4000,
-      system: systemPrompt,
-      messages: [
-        { role: "user", content: "Texto extraído da NF:\n\n" + rawText }
-      ]
-    })
-  });
-  const data = await response.json();
-  const textOut = (data.content || []).map(b => b.text || '').join('\n');
-  const clean = textOut.replace(/```json|```/g, '').trim();
-  return JSON.parse(clean);
+  const itens = [];
+  for(let i=0;i<lines.length;i++){
+    const m = lines[i].match(rowPattern);
+    if(!m) continue;
+
+    const codigoParcial = m[1];
+    let descricao = m[2];
+    const unidade = m[6];
+    const qtdeStr = m[7];
+    let codigoFinal = codigoParcial;
+
+    // o dígito final do código (e eventual resto da descrição) vem na(s) linha(s) seguinte(s)
+    for(let j=i+1; j<Math.min(i+3, lines.length); j++){
+      if(rowPattern.test(lines[j])) break; // já é o próximo produto, não achou continuação
+      const cm = lines[j].match(contPattern);
+      if(cm){
+        codigoFinal = codigoParcial + cm[1];
+        if(cm[2]) descricao = (descricao + ' ' + cm[2]).trim();
+        break;
+      }
+    }
+
+    const quantidade = parseFloat(qtdeStr.replace(/\./g,'').replace(',','.'));
+    if(!isNaN(quantidade)){
+      itens.push({ codigo_produto: codigoFinal, descricao, unidade, quantidade });
+    }
+  }
+  return itens;
 }
 
 // ---------------------------------------------------------------------
@@ -749,17 +742,20 @@ document.getElementById('btnProcess').addEventListener('click', async ()=>{
     setStatus('Lendo texto do PDF...', true);
     const rawText = await extractPdfText(selectedFile);
 
-    setStatus('Interpretando os itens da NF...', true);
-    const parsed = await structureWithClaude(rawText);
+    setStatus('Extraindo os itens da NF...', true);
+    const itens = parseNFItens(rawText);
+    if(itens.length === 0){
+      throw new Error('Nenhum item reconhecido no PDF.');
+    }
 
     setStatus('Cruzando com o cadastro de SKUs...', true);
     CADASTRO = await loadCadastro();
 
-    montarResultado(parsed);
-    setStatus('Pronto. Confira as linhas abaixo.', false);
+    montarResultado({ cabecalho: parseNFCabecalho(rawText), itens });
+    setStatus('Pronto. Confira as linhas abaixo (' + itens.length + ' itens lidos da NF).', false);
   }catch(err){
     console.error(err);
-    setStatus('Não consegui interpretar essa NF automaticamente. Tente novamente ou verifique o arquivo.', false);
+    setStatus('Não consegui reconhecer os itens dessa NF automaticamente. Confira se o PDF é a DANFE original (não digitalizada/escaneada) e tente novamente.', false);
     toast('Erro ao processar a NF.');
   }finally{
     btnProcess.disabled = false;
